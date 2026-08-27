@@ -1,5 +1,6 @@
 #include "gc/tracing.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <string.h>
@@ -11,10 +12,10 @@ typedef struct {
     GcObj objs[];
 } Array;
 
-void array_traverser(GcObj this, void (*traverse)(GcObj)) {
-    Array *arr = this.data;
+void array_traverser(GcObj *this, void (*traverse)(GcObj*)) {
+    Array *arr = this->data;
     for (size_t i = 0; i < arr->size; i++) {
-        traverse(arr->objs[i]);
+        traverse(&arr->objs[i]);
     }
 }
 
@@ -27,39 +28,38 @@ GcObj init_array(size_t size) {
 }
 
 int main() {
-    size_t gen_sizes[] = {0x10000, 0x100000};
+    size_t gen_sizes[] = {0x10000, 0x10000, 0x100000, 0x1000000};
     gc_init((GcInitInfo){
         .gen_buf_sizes = gen_sizes,
-        .gen_count = 2,
+        .gen_count = sizeof(gen_sizes) / sizeof(gen_sizes[0]),
     });
 
-    srand(42);
+    srand(69);
 
-    GcObj objs[1] = {};
-    GcStack stack = {
-        .count = sizeof(objs) / sizeof(GcObj),
-        .objs = objs,
-    };
-
-    gc_push_stack(&stack);
-
-    GcObj * const arr = objs;
-
-    const size_t slot = 10000;
+    const size_t slot = 1000;
     const size_t n = 10000000;
-    *arr = init_array(slot);
+
+    GcStackObj arr = {
+        .obj = init_array(slot),
+        .prev = gc_stack_root,
+    };
+    GcStackObj init = {
+        .prev = &arr
+    };
+    gc_stack_root = &init;
 
     for (size_t i = 0; i < n; i++) {
         size_t idx = rand() % slot;
         size_t size = 8 + (rand() % 0x1000);
-        GcObj init = gc_alloc(size, NULL);
-        memset(init.data, size, size);
-        ((Array*)arr->data)->objs[idx] = init;
+        init.obj = gc_alloc(size, NULL),
+
+        memset(init.obj.data, i, size);
+        ((Array*)arr.obj.data)->objs[idx] = init.obj;
     }
 
-    gc_pop_stack(&stack);
+    gc_stack_root = arr.prev;
 
-    for (size_t i = 0; i < 3; i++) {
+    for (size_t i = 0; i < _gc_gen_count; i++) {
         printf("gen %lu: %lu\n", i, _gc_gen_collect_counts[i]);
     }
 }

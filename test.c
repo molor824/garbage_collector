@@ -6,7 +6,7 @@
 int main() {
     srand(42);
 
-    const int slot = 10000;
+    const int slot = 1000;
     const int n = 10000000;
     int **arr = calloc(slot, sizeof(int *));
 

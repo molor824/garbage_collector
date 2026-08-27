@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <assert.h>
+#include <string.h>
 
 struct AllocHeader;
 typedef struct AllocHeader {
@@ -16,18 +17,21 @@ typedef struct AllocHeader {
     };
 } AllocHeader;
 
-size_t *_gc_gen_collect_counts;
-GenBuffer *_gc_gens;
-size_t _gc_gen_count;
-static GcStack *_current_stack = NULL;
+// Buffer allocates like a stack, from top to bottom.
+// This ensures the linked list points from the most recent to most last, allowing fast allocation and iteration for collection
+typedef struct {
+    void *start;
+    void *end;
+    void *base;
+} GenBuffer;
 
-static size_t _default_buf_sizes[] = {0x100000, 0x800000, 0x1000000};
-const GcInitInfo GC_DEFAULT_INIT_INFO = {
-    .gen_count = sizeof(_default_buf_sizes) / sizeof(_default_buf_sizes[0]),
-    .gen_buf_sizes = _default_buf_sizes,
-};
+size_t *_gc_gen_collect_counts;
+size_t _gc_gen_count;
+GcStackObj *gc_stack_root = NULL;
+static GenBuffer *_gc_gens;
 
 static inline size_t align_up(size_t size, size_t align) {
+    assert(align >= 1);
     return (size + align - 1) / align * align;
 }
 
@@ -38,21 +42,34 @@ void gc_init(GcInitInfo info) {
     for (size_t i = 0; i < _gc_gen_count; i++) {
         GenBuffer *buffer = _gc_gens + i;
         size_t buf_cap = align_up(info.gen_buf_sizes[i], alignof(max_align_t));
-        buffer->start = calloc(buf_cap, 1);
+        buffer->start = malloc(buf_cap);
         buffer->base = buffer->end = buffer->start + buf_cap;
     }
 }
 
-static void *_gc_filter_start, *_gc_filter_end;
-static void _gc_traverse(GcObj root) {
-    if (!root.data) return; // Null object
+static GenBuffer _gc_traverse_buf;
 
-    AllocHeader *header = root.data - sizeof(AllocHeader);
+static void _gc_traverse_mark(GcObj *root) {
+    if (!root || !root->data) return; // Null object
+
+    AllocHeader *header = root->data - sizeof(AllocHeader);
     // If header is outside of filter range, then simply return because not worth marking objects outside of this generation
-    if ((void*)header < _gc_filter_start || (void*)header >= _gc_filter_end) return;
+    // Or if its already marked, then it's most likely that it's a cyclic reference
+    if ((void*)header < _gc_traverse_buf.base || (void*)header >= _gc_traverse_buf.end || header->reachable) return;
 
     header->reachable = 1; // mark as reachable
-    if (root.traverser) root.traverser(root, _gc_traverse);
+    if (root->traverser) root->traverser(root, _gc_traverse_mark);
+}
+
+static void _gc_traverse_relocate(GcObj *root) {
+    if (!root || !root->data) return;
+
+    AllocHeader *header = root->data - sizeof(AllocHeader);
+    // If header is outside of buf range, then it's not this generation's object that requires relocation, skip
+    if ((void*)header < _gc_traverse_buf.base || (void*)header >= _gc_traverse_buf.end) return;
+
+    root->data = header->next_data;
+    if (root->traverser) root->traverser(root, _gc_traverse_relocate);
 }
 
 static AllocHeader *_gc_try_alloc(size_t gen, size_t size);
@@ -63,57 +80,45 @@ void gc_collect(size_t gen) {
 
     GenBuffer *buf = _gc_gens + gen;
 
-    // Setup for traversing
-    _gc_filter_start = buf->base;
-    _gc_filter_end = buf->end;
+    _gc_traverse_buf = *buf;
 
     // Traverse stack tree
-    for (GcStack *stack = _current_stack; stack; stack = stack->prev) {
-        // for each object, check if it's in the current gen
-        for (size_t i = 0; i < stack->count; i++) {
-            _gc_traverse(stack->objs[i]);
-        }
+    for (GcStackObj *obj = gc_stack_root; obj; obj = obj->prev) {
+        _gc_traverse_mark(&obj->obj);
     }
 
-    // Tracing stage
-    // If it's marked, allocate same memory to the next buffer, which probably will trigger another collection if that one is full
-    // In order to prevent new pointers from being collected during the conversion of buffer, create a temporary stack
-    size_t count = 0;
+    // relocation stage
+    // If it's marked, allocate same memory to the next buffer
+    // In order to prevent collection of memory while being updated, we calculate the total size needed first
+    size_t relocate_size = 0;
     for (AllocHeader *header = buf->base; (void*)header < buf->end; header = (void*)header + header->size) {
-        if (header->reachable) count++;
-    }
-    GcObj objs[count] = {}; // Default initialization to null
-    GcStack stack = {
-        .count = count,
-        .objs = objs,
-    };
-    gc_push_stack(&stack); // Make sure the allocation wont collect it
-    count = 0;
-    for (AllocHeader *header = buf->base; (void*)header < buf->end; header = (void*)header + header->size) {
-        assert(header->size);
         if (!header->reachable) continue;
-
-        objs[count].data = (void*)_gc_try_alloc(gen + 1, header->size - sizeof(AllocHeader)) + sizeof(AllocHeader);
-        header->next_data = objs[count].data;
-        count++;
+        relocate_size += header->size;
     }
-    gc_pop_stack(&stack); // We can safely pop because no allocation is gonna be imminent enough to cause relocation during the trace stage
 
-    // NOTE: FROM THIS POINT ON reachable IS INVALID FOR THIS GENERATION
-    // Start traversing the stack, and update the moved pointers
-    for (GcStack *stack = _current_stack; stack; stack = stack->prev) {
-        for (size_t i = 0; i < stack->count; i++) {
-            GcObj *obj = &stack->objs[i];
-            AllocHeader *header = (AllocHeader*)(obj->data - sizeof(AllocHeader));
-            if ((void*)header < buf->base || (void*)header >= buf->end) continue; // If outside of this generation range, then skip
-            obj->data = header->next_data; // Update object pointer if the object is part of this generation (which is being collected)
-            header->reachable = 0; // Reset reachable
+    if (relocate_size) {
+        // Since sizeof(AllocHeader) is added
+        assert(relocate_size > sizeof(AllocHeader));
+        AllocHeader *dst = _gc_try_alloc(gen + 1, relocate_size - sizeof(AllocHeader));
+
+        for (AllocHeader *header = buf->base; (void*)header < buf->end; header = (void*)header + header->size) {
+            if (!header->reachable) continue;
+
+            memcpy(dst, header, header->size);
+            header->next_data = (void*)dst + sizeof(AllocHeader);
+            dst->reachable = 0; // Reset reachable at the new loc
+            dst = (void*)dst + header->size;
+        }
+
+        // NOTE: FROM THIS POINT ON reachable IS INVALID FOR THIS GENERATION
+        // Start traversing the stack, and update the moved pointers
+        for (GcStackObj *obj = gc_stack_root; obj; obj = obj->prev) {
+            _gc_traverse_relocate(&obj->obj);
         }
     }
     // Reset the base header to end
     buf->base = buf->end;
 
-    // printf("collected gen %lu with %lu amount of objects moved to next gen\n", gen, count);
     _gc_gen_collect_counts[gen]++;
 }
 static AllocHeader *_gc_try_alloc(size_t gen, size_t size) {
@@ -142,7 +147,8 @@ static AllocHeader *_gc_try_alloc(size_t gen, size_t size) {
         assert(buf->base == buf->end);
     }
 
-    AllocHeader *base = (AllocHeader*)(buf->base -= total_size);
+    AllocHeader *base = (AllocHeader*)(buf->base - total_size);
+    buf->base = base;
     base->size = total_size;
     base->reachable = 0;
 
@@ -154,11 +160,4 @@ GcObj gc_alloc(size_t size, GcTraverser traverser) {
         .data = header + sizeof(AllocHeader),
         .traverser = traverser,
     };
-}
-void gc_push_stack(GcStack *current) {
-    current->prev = _current_stack;
-    _current_stack = current;
-}
-void gc_pop_stack(GcStack *current) {
-    _current_stack = current->prev;
 }
